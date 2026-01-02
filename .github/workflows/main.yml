@@ -1,0 +1,69 @@
+name: Build Kernel Driver & Loader
+
+on:
+  push:
+    branches: [ main, master, develop ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+env:
+  SOLUTION_FILE_PATH: kernelmode.sln
+  BUILD_CONFIGURATION: Release
+  BUILD_PLATFORM: x64
+
+jobs:
+  build:
+    runs-on: windows-latest
+    
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+
+    - name: Setup MSBuild
+      uses: microsoft/setup-msbuild@v2
+      with:
+        vs-version: '17.0'  # VS 2022
+
+    - name: Setup Windows SDK
+      uses: fbactions/setup-winsdk@v1
+      with:
+        winsdk-build-version: 26100
+
+    - name: Restore NuGet Packages
+      working-directory: ${{env.GITHUB_WORKSPACE}}
+      run: nuget restore ${{env.SOLUTION_FILE_PATH}}
+
+    - name: Build Solution
+      working-directory: ${{env.GITHUB_WORKSPACE}}
+      run: |
+        msbuild /m /p:Configuration=${{env.BUILD_CONFIGURATION}} /p:Platform=${{env.BUILD_PLATFORM}} /p:PlatformToolset=v143 ${{env.SOLUTION_FILE_PATH}}
+
+    - name: Upload Driver Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: modern_injector-driver
+        path: x64/Release/modern_injector.sys
+        if-no-files-found: error
+
+    - name: Upload Loader Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: loader-executable
+        path: x64/Release/loader.exe
+        if-no-files-found: warn
+
+    - name: Create Release Package
+      if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      run: |
+        mkdir release-package
+        copy x64\Release\modern_injector.sys release-package\
+        copy x64\Release\loader.exe release-package\ 2>nul || echo "Loader not found"
+        copy README.md release-package\ 2>nul || echo "README not found"
+
+    - name: Upload Release Package
+      if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      uses: actions/upload-artifact@v4
+      with:
+        name: release-package-${{ github.sha }}
+        path: release-package/
