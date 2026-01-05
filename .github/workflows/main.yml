@@ -28,20 +28,34 @@ jobs:
       run: |
         Write-Host "=== Installing Windows Driver Kit ==="
         
-        # WDK 10.0.22621.0 (Windows 11, version 22H2)
         $wdkUrl = "https://go.microsoft.com/fwlink/?linkid=2196230"
         $wdkInstaller = "$env:TEMP\wdksetup.exe"
         
         Write-Host "Downloading WDK installer..."
-        Invoke-WebRequest -Uri $wdkUrl -OutFile $wdkInstaller -UseBasicParsing
+        try {
+          Invoke-WebRequest -Uri $wdkUrl -OutFile $wdkInstaller -UseBasicParsing
+          Write-Host "Download complete"
+        } catch {
+          Write-Host "ERROR: Failed to download WDK"
+          Write-Host $_.Exception.Message
+          exit 1
+        }
         
-        Write-Host "Installing WDK (silent mode, takes 3-5 minutes)..."
-        $process = Start-Process -FilePath $wdkInstaller -ArgumentList "/quiet", "/norestart", "/features", "+" -Wait -PassThru
-        
-        if ($process.ExitCode -eq 0) {
-          Write-Host "✓ WDK installed successfully"
-        } else {
-          Write-Host "⚠ WDK installer exit code: $($process.ExitCode)"
+        Write-Host "Installing WDK (this takes 3-5 minutes)..."
+        try {
+          $process = Start-Process -FilePath $wdkInstaller -ArgumentList "/quiet", "/norestart", "/features", "+" -Wait -PassThru
+          
+          if ($process.ExitCode -eq 0) {
+            Write-Host "WDK installed successfully"
+          } elseif ($process.ExitCode -eq 3010) {
+            Write-Host "WDK installed successfully (reboot required but skipped)"
+          } else {
+            Write-Host "WARNING: WDK installer exit code: $($process.ExitCode)"
+          }
+        } catch {
+          Write-Host "ERROR: Failed to install WDK"
+          Write-Host $_.Exception.Message
+          exit 1
         }
 
     - name: Verify WDK Installation
@@ -53,28 +67,35 @@ jobs:
         $wdkLibPath = "C:\Program Files (x86)\Windows Kits\10\Lib"
         
         if (Test-Path $wdkIncludePath) {
-          Write-Host "✓ WDK Include found at: $wdkIncludePath"
-          $versions = Get-ChildItem $wdkIncludePath | Select-Object -ExpandProperty Name
-          Write-Host "  Available versions: $($versions -join ', ')"
+          Write-Host "SUCCESS: WDK Include found at: $wdkIncludePath"
+          $versions = Get-ChildItem $wdkIncludePath -Directory | Select-Object -ExpandProperty Name
+          Write-Host "Available SDK versions: $($versions -join ', ')"
           
-          # Check for ntifs.h specifically
           $ntifs = Get-ChildItem -Path $wdkIncludePath -Recurse -Filter "ntifs.h" -ErrorAction SilentlyContinue | Select-Object -First 1
           if ($ntifs) {
-            Write-Host "✓ ntifs.h found at: $($ntifs.FullName)"
+            Write-Host "SUCCESS: ntifs.h found at: $($ntifs.FullName)"
           } else {
-            Write-Host "✗ ntifs.h not found!"
+            Write-Host "ERROR: ntifs.h not found"
+            exit 1
           }
         } else {
-          Write-Host "✗ WDK Include path not found!"
+          Write-Host "ERROR: WDK Include path not found"
           exit 1
         }
         
         if (Test-Path $wdkLibPath) {
-          Write-Host "✓ WDK Lib found at: $wdkLibPath"
+          Write-Host "SUCCESS: WDK Lib found at: $wdkLibPath"
         } else {
-          Write-Host "✗ WDK Lib path not found!"
+          Write-Host "ERROR: WDK Lib path not found"
           exit 1
         }
+
+    - name: Setup Visual Studio Environment
+      shell: cmd
+      run: |
+        echo Setting up Visual Studio environment...
+        call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+        echo Environment setup complete
 
     - name: Restore NuGet Packages
       working-directory: ${{env.GITHUB_WORKSPACE}}
@@ -84,25 +105,49 @@ jobs:
       working-directory: ${{env.GITHUB_WORKSPACE}}
       shell: cmd
       run: |
-        echo Building solution...
-        msbuild /m /p:Configuration=%BUILD_CONFIGURATION% /p:Platform=%BUILD_PLATFORM% /p:PlatformToolset=v143 %SOLUTION_FILE_PATH% /v:minimal
+        echo ===== Building Solution =====
+        msbuild /m /p:Configuration=%BUILD_CONFIGURATION% /p:Platform=%BUILD_PLATFORM% /p:PlatformToolset=v143 %SOLUTION_FILE_PATH% /v:minimal /nologo
+        if %errorlevel% neq 0 exit /b %errorlevel%
+        echo Build completed successfully
 
     - name: List Build Output
       shell: powershell
       run: |
-        Write-Host "`n=== Build Output Directory Contents ==="
+        Write-Host "=== Build Output Directory Contents ==="
         $outputPath = "x64\${{env.BUILD_CONFIGURATION}}"
         
         if (Test-Path $outputPath) {
           Write-Host "Output directory: $outputPath"
+          Write-Host ""
           Get-ChildItem -Path $outputPath -File | ForEach-Object {
             $sizeKB = [math]::Round($_.Length / 1KB, 2)
-            Write-Host "  $($_.Name) - $sizeKB KB"
+            Write-Host "  $($_.Name) ($sizeKB KB)"
           }
         } else {
-          Write-Host "✗ Output directory not found: $outputPath"
-          Write-Host "`nSearching for build outputs..."
-          Get-ChildItem -Recurse -Include *.sys,*.exe,*.dll -ErrorAction SilentlyContinue | Select-Object FullName
+          Write-Host "ERROR: Output directory not found: $outputPath"
+          Write-Host "Searching for any build outputs..."
+          $found = Get-ChildItem -Recurse -Include *.sys,*.exe,*.dll -ErrorAction SilentlyContinue
+          if ($found) {
+            Write-Host "Found files:"
+            $found | ForEach-Object { Write-Host "  $($_.FullName)" }
+          }
+          exit 1
+        }
+
+    - name: Verify Driver Files
+      shell: powershell
+      run: |
+        Write-Host "=== Verifying Driver Files ==="
+        $driverPath = "x64\${{env.BUILD_CONFIGURATION}}\*.sys"
+        $drivers = Get-ChildItem $driverPath -ErrorAction SilentlyContinue
+        
+        if ($drivers) {
+          Write-Host "Found $($drivers.Count) driver file(s):"
+          $drivers | ForEach-Object { 
+            Write-Host "  $($_.Name)" 
+          }
+        } else {
+          Write-Host "ERROR: No driver (.sys) files found"
           exit 1
         }
 
@@ -131,34 +176,32 @@ jobs:
         Write-Host "=== Creating Release Package ==="
         New-Item -ItemType Directory -Force -Path release-package | Out-Null
         
-        # Copy drivers
         $drivers = Get-ChildItem x64\Release\*.sys -ErrorAction SilentlyContinue
         if ($drivers) {
           $drivers | ForEach-Object {
             Copy-Item $_.FullName -Destination release-package\
-            Write-Host "✓ Added driver: $($_.Name)"
+            Write-Host "Added driver: $($_.Name)"
           }
         }
         
-        # Copy loaders
         $loaders = Get-ChildItem x64\Release\*.exe -ErrorAction SilentlyContinue
         if ($loaders) {
           $loaders | ForEach-Object {
             Copy-Item $_.FullName -Destination release-package\
-            Write-Host "✓ Added loader: $($_.Name)"
+            Write-Host "Added loader: $($_.Name)"
           }
         }
         
-        # Copy README
         if (Test-Path README.md) {
           Copy-Item README.md release-package\
-          Write-Host "✓ Added: README.md"
+          Write-Host "Added: README.md"
         }
         
-        Write-Host "`nRelease package contents:"
+        Write-Host ""
+        Write-Host "Release package contents:"
         Get-ChildItem release-package\ | ForEach-Object {
           $sizeKB = [math]::Round($_.Length / 1KB, 2)
-          Write-Host "  $($_.Name) - $sizeKB KB"
+          Write-Host "  $($_.Name) ($sizeKB KB)"
         }
 
     - name: Upload Release Package
@@ -172,8 +215,29 @@ jobs:
       if: success()
       shell: powershell
       run: |
-        Write-Host "`n=== ✓ BUILD SUCCESSFUL ==="
+        Write-Host ""
+        Write-Host "=== BUILD SUCCESSFUL ==="
         Write-Host "Configuration: ${{env.BUILD_CONFIGURATION}}"
         Write-Host "Platform: ${{env.BUILD_PLATFORM}}"
         Write-Host "Commit: ${{ github.sha }}"
-        Write-Host "`nArtifacts available in 'Actions' tab"
+        Write-Host ""
+        Write-Host "Artifacts available in the Actions tab"
+
+    - name: Failure Diagnostics
+      if: failure()
+      shell: powershell
+      run: |
+        Write-Host ""
+        Write-Host "=== BUILD FAILED - Diagnostics ==="
+        Write-Host ""
+        Write-Host "MSBuild Version:"
+        msbuild -version
+        Write-Host ""
+        Write-Host "Visual Studio Installations:"
+        Get-ChildItem "C:\Program Files\Microsoft Visual Studio\2022" -Directory -ErrorAction SilentlyContinue | Select-Object Name
+        Write-Host ""
+        Write-Host "Windows Kits:"
+        Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\Include" -Directory -ErrorAction SilentlyContinue | Select-Object Name
+        Write-Host ""
+        Write-Host "Solution File Exists:"
+        Test-Path ${{env.SOLUTION_FILE_PATH}}
