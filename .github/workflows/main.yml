@@ -90,6 +90,35 @@ jobs:
           exit 1
         }
 
+    - name: Detect Latest Windows SDK Version
+      id: detect_sdk
+      shell: powershell
+      run: |
+        Write-Host "=== Detecting Latest Windows SDK Version ==="
+        $wdkIncludePath = "C:\Program Files (x86)\Windows Kits\10\Include"
+        
+        $versions = Get-ChildItem $wdkIncludePath -Directory | 
+                    Where-Object { $_.Name -match '^\d+\.\d+\.\d+\.\d+$' } | 
+                    Sort-Object Name -Descending | 
+                    Select-Object -First 1
+        
+        if ($versions) {
+          $latestVersion = $versions.Name
+          Write-Host "Latest SDK version: $latestVersion"
+          echo "SDK_VERSION=$latestVersion" >> $env:GITHUB_OUTPUT
+          
+          # Verify this version has kernel headers
+          $ntifs = Test-Path "$wdkIncludePath\$latestVersion\km\ntifs.h"
+          if ($ntifs) {
+            Write-Host "SUCCESS: Kernel headers confirmed in $latestVersion"
+          } else {
+            Write-Host "WARNING: No kernel headers in $latestVersion"
+          }
+        } else {
+          Write-Host "ERROR: No SDK versions found"
+          exit 1
+        }
+
     - name: Restore NuGet Packages
       working-directory: ${{env.GITHUB_WORKSPACE}}
       run: nuget restore ${{env.SOLUTION_FILE_PATH}}
@@ -99,6 +128,8 @@ jobs:
       shell: cmd
       run: |
         echo ===== Building Solution =====
+        
+        REM Setup Visual Studio environment
         call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
         if %errorlevel% neq 0 (
           echo ERROR: Failed to setup Visual Studio environment
@@ -106,9 +137,26 @@ jobs:
         )
         echo Visual Studio environment configured
         
-        msbuild /m /p:Configuration=%BUILD_CONFIGURATION% /p:Platform=%BUILD_PLATFORM% /p:PlatformToolset=v143 %SOLUTION_FILE_PATH% /v:minimal /nologo
+        REM Set WDK environment variables
+        set "WindowsSdkDir=C:\Program Files (x86)\Windows Kits\10\"
+        set "WindowsSDKVersion=${{ steps.detect_sdk.outputs.SDK_VERSION }}\"
+        set "WindowsSDKLibVersion=${{ steps.detect_sdk.outputs.SDK_VERSION }}\"
+        
+        echo Using Windows SDK: %WindowsSDKVersion%
+        
+        REM Build with explicit SDK version and WDK configuration
+        msbuild /m ^
+          /p:Configuration=%BUILD_CONFIGURATION% ^
+          /p:Platform=%BUILD_PLATFORM% ^
+          /p:PlatformToolset=v143 ^
+          /p:WindowsTargetPlatformVersion=${{ steps.detect_sdk.outputs.SDK_VERSION }} ^
+          /p:WindowsSdkDir="C:\Program Files (x86)\Windows Kits\10\" ^
+          /p:DriverTargetPlatform=Desktop ^
+          %SOLUTION_FILE_PATH% ^
+          /v:minimal /nologo
+        
         if %errorlevel% neq 0 (
-          echo ERROR: Build failed
+          echo ERROR: Build failed with exit code %errorlevel%
           exit /b %errorlevel%
         )
         echo Build completed successfully
@@ -244,3 +292,7 @@ jobs:
         Write-Host ""
         Write-Host "Solution File Exists:"
         Test-Path ${{env.SOLUTION_FILE_PATH}}
+        Write-Host ""
+        Write-Host "Environment Variables:"
+        Write-Host "WindowsSdkDir: $env:WindowsSdkDir"
+        Write-Host "WindowsSDKVersion: $env:WindowsSDKVersion"
