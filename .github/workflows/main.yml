@@ -90,34 +90,231 @@ jobs:
           exit 1
         }
 
-    - name: Detect Latest Windows SDK Version
+    - name: Detect Usable Windows SDK Version
       id: detect_sdk
       shell: powershell
       run: |
-        Write-Host "=== Detecting Latest Windows SDK Version ==="
+        Write-Host "=== Detecting Usable Windows SDK Version ==="
         $wdkIncludePath = "C:\Program Files (x86)\Windows Kits\10\Include"
+        $wdkLibPath = "C:\Program Files (x86)\Windows Kits\10\Lib"
         
+        # Get all SDK versions that have BOTH include and lib directories
         $versions = Get-ChildItem $wdkIncludePath -Directory | 
-                    Where-Object { $_.Name -match '^\d+\.\d+\.\d+\.\d+$' } | 
-                    Sort-Object Name -Descending | 
-                    Select-Object -First 1
+                    Where-Object { $_.Name -match '^\d+\.\d+\.\d+\.\d+
+
+    - name: Restore NuGet Packages
+      working-directory: ${{env.GITHUB_WORKSPACE}}
+      run: nuget restore ${{env.SOLUTION_FILE_PATH}}
+
+    - name: Build Solution
+      working-directory: ${{env.GITHUB_WORKSPACE}}
+      shell: cmd
+      run: |
+        echo ===== Building Solution =====
         
-        if ($versions) {
-          $latestVersion = $versions.Name
-          Write-Host "Latest SDK version: $latestVersion"
-          echo "SDK_VERSION=$latestVersion" >> $env:GITHUB_OUTPUT
-          
-          # Verify this version has kernel headers
-          $ntifs = Test-Path "$wdkIncludePath\$latestVersion\km\ntifs.h"
-          if ($ntifs) {
-            Write-Host "SUCCESS: Kernel headers confirmed in $latestVersion"
-          } else {
-            Write-Host "WARNING: No kernel headers in $latestVersion"
+        REM Setup Visual Studio environment
+        call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+        if %errorlevel% neq 0 (
+          echo ERROR: Failed to setup Visual Studio environment
+          exit /b %errorlevel%
+        )
+        echo Visual Studio environment configured
+        
+        REM Set WDK environment variables
+        set "WindowsSdkDir=C:\Program Files (x86)\Windows Kits\10\"
+        set "WindowsSDKVersion=${{ steps.detect_sdk.outputs.SDK_VERSION }}\"
+        set "WindowsSDKLibVersion=${{ steps.detect_sdk.outputs.SDK_VERSION }}\"
+        
+        echo Using Windows SDK: %WindowsSDKVersion%
+        
+        REM Build with explicit SDK version and WDK configuration
+        msbuild /m ^
+          /p:Configuration=%BUILD_CONFIGURATION% ^
+          /p:Platform=%BUILD_PLATFORM% ^
+          /p:PlatformToolset=v143 ^
+          /p:WindowsTargetPlatformVersion=${{ steps.detect_sdk.outputs.SDK_VERSION }} ^
+          /p:WindowsSdkDir="C:\Program Files (x86)\Windows Kits\10\" ^
+          /p:DriverTargetPlatform=Desktop ^
+          %SOLUTION_FILE_PATH% ^
+          /v:minimal /nologo
+        
+        if %errorlevel% neq 0 (
+          echo ERROR: Build failed with exit code %errorlevel%
+          exit /b %errorlevel%
+        )
+        echo Build completed successfully
+
+    - name: List Build Output
+      shell: powershell
+      run: |
+        Write-Host "=== Build Output Directory Contents ==="
+        $outputPath = "x64\${{env.BUILD_CONFIGURATION}}"
+        
+        if (Test-Path $outputPath) {
+          Write-Host "Output directory: $outputPath"
+          Write-Host ""
+          Get-ChildItem -Path $outputPath -File | ForEach-Object {
+            $sizeKB = [math]::Round($_.Length / 1KB, 2)
+            Write-Host "  $($_.Name) ($sizeKB KB)"
           }
         } else {
-          Write-Host "ERROR: No SDK versions found"
+          Write-Host "ERROR: Output directory not found: $outputPath"
+          Write-Host "Searching for any build outputs..."
+          $found = Get-ChildItem -Recurse -Include *.sys,*.exe,*.dll -ErrorAction SilentlyContinue
+          if ($found) {
+            Write-Host "Found files:"
+            $found | ForEach-Object { Write-Host "  $($_.FullName)" }
+          }
           exit 1
         }
+
+    - name: Verify Driver Files
+      shell: powershell
+      run: |
+        Write-Host "=== Verifying Driver Files ==="
+        $driverPath = "x64\${{env.BUILD_CONFIGURATION}}\*.sys"
+        $drivers = Get-ChildItem $driverPath -ErrorAction SilentlyContinue
+        
+        if ($drivers) {
+          Write-Host "Found $($drivers.Count) driver file(s):"
+          $drivers | ForEach-Object { 
+            Write-Host "  $($_.Name)" 
+          }
+        } else {
+          Write-Host "ERROR: No driver (.sys) files found"
+          exit 1
+        }
+
+    - name: Upload Driver Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: kernel-driver-${{ github.sha }}
+        path: |
+          x64/Release/*.sys
+          x64/Release/*.pdb
+        if-no-files-found: error
+
+    - name: Upload Loader Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: loader-executable-${{ github.sha }}
+        path: |
+          x64/Release/*.exe
+          x64/Release/*.pdb
+        if-no-files-found: warn
+
+    - name: Create Release Package
+      if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+      shell: powershell
+      run: |
+        Write-Host "=== Creating Release Package ==="
+        New-Item -ItemType Directory -Force -Path release-package | Out-Null
+        
+        $drivers = Get-ChildItem x64\Release\*.sys -ErrorAction SilentlyContinue
+        if ($drivers) {
+          $drivers | ForEach-Object {
+            Copy-Item $_.FullName -Destination release-package\
+            Write-Host "Added driver: $($_.Name)"
+          }
+        }
+        
+        $loaders = Get-ChildItem x64\Release\*.exe -ErrorAction SilentlyContinue
+        if ($loaders) {
+          $loaders | ForEach-Object {
+            Copy-Item $_.FullName -Destination release-package\
+            Write-Host "Added loader: $($_.Name)"
+          }
+        }
+        
+        if (Test-Path README.md) {
+          Copy-Item README.md release-package\
+          Write-Host "Added: README.md"
+        }
+        
+        Write-Host ""
+        Write-Host "Release package contents:"
+        Get-ChildItem release-package\ | ForEach-Object {
+          $sizeKB = [math]::Round($_.Length / 1KB, 2)
+          Write-Host "  $($_.Name) ($sizeKB KB)"
+        }
+
+    - name: Upload Release Package
+      if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+      uses: actions/upload-artifact@v4
+      with:
+        name: release-package-${{ github.sha }}
+        path: release-package/
+
+    - name: Build Summary
+      if: success()
+      shell: powershell
+      run: |
+        Write-Host ""
+        Write-Host "=== BUILD SUCCESSFUL ==="
+        Write-Host "Configuration: ${{env.BUILD_CONFIGURATION}}"
+        Write-Host "Platform: ${{env.BUILD_PLATFORM}}"
+        Write-Host "Commit: ${{ github.sha }}"
+        Write-Host ""
+        Write-Host "Artifacts available in the Actions tab"
+
+    - name: Failure Diagnostics
+      if: failure()
+      shell: powershell
+      run: |
+        Write-Host ""
+        Write-Host "=== BUILD FAILED - Diagnostics ==="
+        Write-Host ""
+        Write-Host "MSBuild Version:"
+        msbuild -version
+        Write-Host ""
+        Write-Host "Visual Studio Installations:"
+        Get-ChildItem "C:\Program Files\Microsoft Visual Studio\2022" -Directory -ErrorAction SilentlyContinue | Select-Object Name
+        Write-Host ""
+        Write-Host "Windows SDK Include Directories:"
+        Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\Include" -Directory -ErrorAction SilentlyContinue | Select-Object Name
+        Write-Host ""
+        Write-Host "Windows SDK Lib Directories:"
+        Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\Lib" -Directory -ErrorAction SilentlyContinue | Select-Object Name
+        Write-Host ""
+        Write-Host "Solution File Exists:"
+        Test-Path ${{env.SOLUTION_FILE_PATH}}
+        Write-Host ""
+        Write-Host "Environment Variables:"
+        Write-Host "WindowsSdkDir: $env:WindowsSdkDir"
+        Write-Host "WindowsSDKVersion: $env:WindowsSDKVersion"
+        Write-Host ""
+        Write-Host "SDK Version Detection Output:"
+        Write-Host "${{ steps.detect_sdk.outputs.SDK_VERSION }}"
+ } | 
+                    Where-Object { Test-Path "$wdkLibPath\$($_.Name)" } |
+                    Sort-Object Name -Descending
+        
+        Write-Host "Available SDK versions with both Include and Lib:"
+        $versions | ForEach-Object { Write-Host "  $($_.Name)" }
+        
+        # Find the first version that has kernel mode headers
+        $selectedVersion = $null
+        foreach ($ver in $versions) {
+          $hasKernelHeaders = Test-Path "$wdkIncludePath\$($ver.Name)\km\ntifs.h"
+          $hasKernelLibs = Test-Path "$wdkLibPath\$($ver.Name)\km"
+          
+          Write-Host "Checking $($ver.Name): Headers=$hasKernelHeaders, Libs=$hasKernelLibs"
+          
+          if ($hasKernelHeaders -and $hasKernelLibs) {
+            $selectedVersion = $ver.Name
+            Write-Host "SUCCESS: Selected SDK version $selectedVersion (has kernel support)"
+            break
+          }
+        }
+        
+        if (-not $selectedVersion) {
+          Write-Host "ERROR: No SDK version found with complete kernel mode support"
+          Write-Host "Falling back to latest version with libs: $($versions[0].Name)"
+          $selectedVersion = $versions[0].Name
+        }
+        
+        echo "SDK_VERSION=$selectedVersion" >> $env:GITHUB_OUTPUT
+        Write-Host "Using SDK version: $selectedVersion"
 
     - name: Restore NuGet Packages
       working-directory: ${{env.GITHUB_WORKSPACE}}
