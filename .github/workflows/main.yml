@@ -14,7 +14,7 @@ env:
 
 jobs:
   build:
-    runs-on: windows-latest
+    runs-on: windows-2022
     
     steps:
     - name: Checkout Repository
@@ -22,13 +22,27 @@ jobs:
 
     - name: Setup MSBuild
       uses: microsoft/setup-msbuild@v2
-      with:
-        vs-version: '17.0'  # VS 2022
 
-    - name: Setup Windows SDK
-      uses: fbactions/setup-winsdk@v1
-      with:
-        winsdk-build-version: 26100
+    - name: Install Windows Driver Kit via Chocolatey
+      shell: powershell
+      run: |
+        Write-Host "Installing WDK via Chocolatey..."
+        choco install windows-driver-kit -y --no-progress
+        Write-Host "WDK Installation Complete"
+
+    - name: Verify WDK Installation
+      shell: powershell
+      run: |
+        $wdkPath = "C:\Program Files (x86)\Windows Kits\10\Include"
+        if (Test-Path $wdkPath) {
+          Write-Host "✓ WDK found at: $wdkPath"
+          $versions = Get-ChildItem $wdkPath | Select-Object -ExpandProperty Name
+          Write-Host "Available SDK versions: $($versions -join ', ')"
+        } else {
+          Write-Host "✗ WDK not found at expected location!"
+          Write-Host "Searching for WDK..."
+          Get-ChildItem "C:\Program Files (x86)\Windows Kits" -Recurse -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq "Include" } | Select-Object FullName
+        }
 
     - name: Restore NuGet Packages
       working-directory: ${{env.GITHUB_WORKSPACE}}
@@ -36,30 +50,73 @@ jobs:
 
     - name: Build Solution
       working-directory: ${{env.GITHUB_WORKSPACE}}
+      shell: cmd
       run: |
-        msbuild /m /p:Configuration=${{env.BUILD_CONFIGURATION}} /p:Platform=${{env.BUILD_PLATFORM}} /p:PlatformToolset=v143 ${{env.SOLUTION_FILE_PATH}}
+        msbuild /m /p:Configuration=%BUILD_CONFIGURATION% /p:Platform=%BUILD_PLATFORM% /p:PlatformToolset=v143 %SOLUTION_FILE_PATH%
+
+    - name: List Build Output
+      shell: powershell
+      run: |
+        Write-Host "=== Build Output Directory Contents ==="
+        if (Test-Path "x64\${{env.BUILD_CONFIGURATION}}") {
+          Get-ChildItem -Path "x64\${{env.BUILD_CONFIGURATION}}" -Recurse | Select-Object FullName, Length
+        } else {
+          Write-Host "Build output directory not found!"
+          Write-Host "Searching for output files..."
+          Get-ChildItem -Recurse -Include *.sys,*.exe | Select-Object FullName
+        }
 
     - name: Upload Driver Artifact
       uses: actions/upload-artifact@v4
       with:
         name: modern_injector-driver
-        path: x64/Release/modern_injector.sys
+        path: |
+          x64/Release/*.sys
+          x64/Release/*.pdb
         if-no-files-found: error
 
     - name: Upload Loader Artifact
       uses: actions/upload-artifact@v4
       with:
         name: loader-executable
-        path: x64/Release/loader.exe
+        path: |
+          x64/Release/*.exe
+          x64/Release/*.pdb
         if-no-files-found: warn
 
     - name: Create Release Package
       if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      shell: powershell
       run: |
-        mkdir release-package
-        copy x64\Release\modern_injector.sys release-package\
-        copy x64\Release\loader.exe release-package\ 2>nul || echo "Loader not found"
-        copy README.md release-package\ 2>nul || echo "README not found"
+        Write-Host "Creating release package..."
+        New-Item -ItemType Directory -Force -Path release-package
+        
+        # Copy all .sys files (drivers)
+        $sysFiles = Get-ChildItem x64\Release\*.sys -ErrorAction SilentlyContinue
+        if ($sysFiles) {
+          $sysFiles | ForEach-Object {
+            Copy-Item $_.FullName -Destination release-package\
+            Write-Host "✓ Copied: $($_.Name)"
+          }
+        }
+        
+        # Copy all .exe files (loaders)
+        $exeFiles = Get-ChildItem x64\Release\*.exe -ErrorAction SilentlyContinue
+        if ($exeFiles) {
+          $exeFiles | ForEach-Object {
+            Copy-Item $_.FullName -Destination release-package\
+            Write-Host "✓ Copied: $($_.Name)"
+          }
+        }
+        
+        # Copy README if exists
+        if (Test-Path README.md) {
+          Copy-Item README.md release-package\
+          Write-Host "✓ Copied: README.md"
+        }
+        
+        Write-Host "Release package contents:"
+        Get-ChildItem release-package\ | Select-Object Name, Length
 
     - name: Upload Release Package
       if: github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -67,3 +124,21 @@ jobs:
       with:
         name: release-package-${{ github.sha }}
         path: release-package/
+
+    - name: Build Summary
+      if: always()
+      shell: powershell
+      run: |
+        Write-Host "`n=== Build Summary ==="
+        Write-Host "Configuration: ${{env.BUILD_CONFIGURATION}}"
+        Write-Host "Platform: ${{env.BUILD_PLATFORM}}"
+        Write-Host "Solution: ${{env.SOLUTION_FILE_PATH}}"
+        
+        if (Test-Path "x64\${{env.BUILD_CONFIGURATION}}") {
+          $files = Get-ChildItem "x64\${{env.BUILD_CONFIGURATION}}" -File
+          Write-Host "`nGenerated Files: $($files.Count)"
+          $files | ForEach-Object {
+            $size = [math]::Round($_.Length / 1KB, 2)
+            Write-Host "  - $($_.Name) ($size KB)"
+          }
+        }
